@@ -20,6 +20,7 @@
   import { themeMode, cycleTheme } from "$lib/stores/theme";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { tocVisible, tocEntries } from "$lib/stores/toc";
   import Toolbar from "$lib/components/Toolbar.svelte";
   import MarkdownRenderer from "$lib/components/MarkdownRenderer.svelte";
@@ -50,6 +51,8 @@
   import { saveProgress, getProgress } from "$lib/stores/readingProgress";
 
   let rendererReady = $state(false);
+  let openFilesFlush: Promise<void> | null = null;
+  let openFilesFlushRequested = false;
   let lastWatchedPath: string | null = null;
   let searchVisible = $state(false);
   let pasteVisible = $state(false);
@@ -113,6 +116,29 @@
     if (document.documentElement.scrollHeight <= window.innerHeight) return;
     const line = getCurrentSourceLine("viewer");
     saveProgress(tab.filePath, line);
+  }
+
+  function requestOpenedFilesFlush() {
+    openFilesFlushRequested = true;
+    if (!rendererReady || openFilesFlush) return;
+
+    openFilesFlush = (async () => {
+      try {
+        while (openFilesFlushRequested) {
+          openFilesFlushRequested = false;
+          const openedFiles = await invoke<string[]>("get_opened_files");
+          for (const path of openedFiles) {
+            await openFile(path);
+          }
+        }
+      } catch {}
+      finally {
+        openFilesFlush = null;
+        // A second-instance event can arrive between the final read and the
+        // cleanup above. Keep draining until the buffer is definitely empty.
+        if (openFilesFlushRequested && rendererReady) requestOpenedFilesFlush();
+      }
+    })();
   }
 
   function handleVisibilityChange() {
@@ -470,6 +496,14 @@
   onMount(() => {
     initRenderer();
     rendererReady = true;
+    let unlistenOpenFiles: (() => void) | undefined;
+    let listenActive = true;
+    void listen("mdhero-open-files", () => {
+      requestOpenedFilesFlush();
+    }).then((unlisten) => {
+      if (listenActive) unlistenOpenFiles = unlisten;
+      else unlisten();
+    }).catch(() => {});
 
     // Expose functions for native menu and OS file-open handlers
     (window as any).__mdhero_open_file = () => { openVisible = true; };
@@ -579,14 +613,10 @@
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
     void (async () => {
-      // Check for files opened via "Open With" / double-click (buffered in Rust state)
-      try {
-        const { invoke } = await import("@tauri-apps/api/core");
-        const openedFiles = await invoke<string[]>("get_opened_files");
-        if (openedFiles.length > 0) {
-          await openFile(openedFiles[0]);
-        }
-      } catch {}
+      // Check for files opened via "Open With" / double-click (buffered in Rust state).
+      // This drains every path, including paths forwarded by the Windows
+      // single-instance plugin.
+      requestOpenedFilesFlush();
 
       // Check for updates (non-blocking, skips in dev)
       checkForUpdates();
@@ -604,6 +634,8 @@
     })();
 
     return () => {
+      listenActive = false;
+      unlistenOpenFiles?.();
       window.removeEventListener("keydown", handleKeydown);
       window.removeEventListener("keyup", handleKeyup);
       window.removeEventListener("blur", stopScroll);

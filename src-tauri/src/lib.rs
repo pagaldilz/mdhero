@@ -5,6 +5,14 @@ mod watcher;
 use std::sync::Mutex;
 use tauri::Manager;
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use std::path::Path;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use tauri::{Emitter, Runtime};
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+const OPEN_FILES_EVENT: &str = "mdhero-open-files";
+
 /// Stores file paths received from OS "Open With" events.
 /// These arrive before the webview is ready, so we buffer them.
 pub struct OpenedFiles {
@@ -25,6 +33,74 @@ fn get_opened_files(state: tauri::State<'_, OpenedFiles>) -> Vec<String> {
     let result = paths.clone();
     paths.clear();
     result
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .map(|e| matches!(e.as_str(), "md" | "markdown" | "mdown" | "mkd"))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_command_line_path(raw: &str, cwd: &Path) -> Option<String> {
+    // Windows normally removes surrounding quotes before Rust sees argv, but
+    // accepting them here keeps the handoff safe for custom launchers too.
+    let raw = raw
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(raw);
+    if raw.is_empty() || raw.starts_with('-') {
+        return None;
+    }
+
+    let path = Path::new(raw);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+
+    if is_markdown_path(&path) && path.is_file() {
+        Some(path.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn markdown_paths<I>(args: I, cwd: &Path) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    args.into_iter()
+        .filter_map(|arg| resolve_command_line_path(&arg, cwd))
+        .collect()
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn queue_opened_files<R: Runtime>(app: &tauri::AppHandle<R>, paths: Vec<String>) {
+    if paths.is_empty() {
+        return;
+    }
+
+    if let Some(state) = app.try_state::<OpenedFiles>() {
+        if let Ok(mut queued) = state.paths.lock() {
+            queued.extend(paths);
+        }
+    }
+
+    // Restore/focus the existing window before asking the frontend to open the
+    // files. The event is only a wake-up; the paths stay buffered until the
+    // webview consumes them, so files opened during startup are not lost.
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    let _ = app.emit(OPEN_FILES_EVENT, ());
 }
 
 /// Parse a `mdhero://open?path=<url-encoded-abs-path>` deep link into an
@@ -51,14 +127,7 @@ fn parse_mdhero_url(url: &tauri::Url) -> Option<String> {
     };
 
     let path = std::path::Path::new(&expanded);
-    let is_md = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .map(|e| matches!(e.as_str(), "md" | "markdown" | "mdown" | "mkd"))
-        .unwrap_or(false);
-
-    if path.is_absolute() && is_md && path.exists() {
+    if path.is_absolute() && is_markdown_path(path) && path.is_file() {
         Some(expanded)
     } else {
         None
@@ -67,7 +136,21 @@ fn parse_mdhero_url(url: &tauri::Url) -> Option<String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    // Register the handoff buffer before the single-instance plugin can
+    // receive a second launch during startup.
+    let builder = tauri::Builder::default().manage(OpenedFiles::default());
+
+    // Windows launches a fresh process for every file association unless the
+    // app claims a single-instance mutex. The plugin forwards the second
+    // process argv to the first process, where we queue and open the paths.
+    #[cfg(target_os = "windows")]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+        let cwd = Path::new(&cwd);
+        let paths = markdown_paths(argv.into_iter().skip(1), cwd);
+        queue_opened_files(app, paths);
+    }));
+
+    builder
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -75,7 +158,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_cli::init())
         .manage(watcher::WatcherState::default())
-        .manage(OpenedFiles::default())
         .invoke_handler(tauri::generate_handler![
             commands::read_markdown_file,
             commands::write_markdown_file,
@@ -153,9 +235,9 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app_handle, event| {
+        .run(|_app_handle, _event| {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Opened { urls } = event {
+            if let tauri::RunEvent::Opened { urls } = _event {
                 let app_handle = _app_handle;
                 let mut file_paths: Vec<String> = Vec::new();
 
@@ -181,25 +263,45 @@ pub fn run() {
                     return;
                 }
 
-                // Try to send directly to frontend if webview is ready
-                if let Some(window) = app_handle.get_webview_window("main") {
-                    for file_path in &file_paths {
-                        let js = format!(
-                            "window.__mdhero_open_path?.({})",
-                            serde_json::json!(file_path)
-                        );
-                        let _ = window.eval(&js);
-                    }
-                }
-
-                // Also buffer in state in case webview isn't ready yet
-                if let Some(state) = app_handle.try_state::<OpenedFiles>() {
-                    if let Ok(mut paths) = state.paths.lock() {
-                        paths.extend(file_paths);
-                    }
-                }
+                queue_opened_files(app_handle, file_paths);
             }
         });
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod file_argument_tests {
+    use super::markdown_paths;
+    use std::path::Path;
+
+    #[test]
+    fn collects_existing_markdown_paths_and_ignores_other_arguments() {
+        let root = std::env::temp_dir().join(format!("mdhero-open-files-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.md");
+        let second = root.join("second.MARKDOWN");
+        let ignored = root.join("ignored.txt");
+        std::fs::write(&first, "# first").unwrap();
+        std::fs::write(&second, "# second").unwrap();
+        std::fs::write(&ignored, "ignored").unwrap();
+
+        let paths = markdown_paths(
+            vec![
+                "mdhero.exe".to_string(),
+                first.file_name().unwrap().to_string_lossy().into_owned(),
+                second.file_name().unwrap().to_string_lossy().into_owned(),
+                ignored.file_name().unwrap().to_string_lossy().into_owned(),
+                "--some-flag".to_string(),
+            ],
+            Path::new(&root),
+        );
+
+        assert_eq!(paths, vec![
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ]);
+
+        std::fs::remove_dir_all(root).ok();
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
